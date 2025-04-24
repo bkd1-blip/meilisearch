@@ -33,6 +33,7 @@ app.post("/sync-feeds", async (req, res) => {
       "attributes.creator.data.attributes.firstName",
       "attributes.creator.data.attributes.lastName",
     ]);
+    await index.updateSortableAttributes(["attributes.createdAt"]);
     await index.updateFilterableAttributes([
       "attributes.type",
       "attributes.created_by",
@@ -63,14 +64,23 @@ app.post("/delete-index", async (req, res) => {
 app.post("/sync-people", async (req, res) => {
   try {
     const { rows } = await pool.query(getUserQuery);
-    // console.log({ rows });
+
     const index = client.index("people");
     await index.updateSearchableAttributes([
       "firstName",
       "lastName",
       "displayName",
+      "role",
     ]);
-
+    await index.updateSortableAttributes(["createdAt"]);
+    await index.updateFilterableAttributes([
+      "firstName",
+      "lastName",
+      "displayName",
+      "role",
+      "connections",
+      "interests",
+    ]);
     const result = await index.addDocuments(rows);
     res.json({ message: "Feeds synced", indexed: result });
   } catch (err) {

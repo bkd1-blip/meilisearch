@@ -594,7 +594,29 @@ DistinctFeeds AS (
   LEFT JOIN Last5CommentsPerFeed ON feeds.id = Last5CommentsPerFeed.feed_id
   LEFT JOIN EventDetails ON feeds.type_id = EventDetails.event_id
   LEFT JOIN EventQuestionDetails ON feeds.id = EventQuestionDetails.feed_id
-  LEFT JOIN AggregatedSubscribers ON AggregatedSubscribers.event_id = feeds.event
+  LEFT JOIN AggregatedSubscribers ON 
+    (feeds.type = 'question' AND AggregatedSubscribers.event_id = feeds.event)
+    OR 
+    (feeds.type <> 'question' AND AggregatedSubscribers.event_id = feeds.type_id)
+  WHERE 
+    feeds.type = 'q&a-pos' OR
+    feeds.type = 'q&a-pre' AND NOT EXISTS (
+      SELECT 1 
+      FROM feeds AS subquery
+      WHERE subquery.type = 'q&a-pos'
+        AND subquery.type_id = feeds.type_id
+        AND subquery.id != feeds.id
+    )
+    OR
+    feeds.type = 'question' AND NOT EXISTS (
+      SELECT 1 
+      FROM feeds AS subquery
+      WHERE subquery.type = 'q&a-pos'
+        AND subquery.type_id = feeds.event  -- Note correlation with feeds.event
+        AND subquery.id != feeds.id
+    )
+    OR
+    feeds.type NOT IN ('q&a-pre', 'question')
   ORDER BY pinned DESC, "createdAt" DESC
 )
 
@@ -638,7 +660,7 @@ SELECT
       )
     ),
     'comments_by_user', comments,
-    'lastFiveComments', lastFiveComments, -- Ensures empty array if no comments
+    'lastFiveComments', lastFiveComments,
     'event', event,
     'group', json_build_object('data', json_build_object('attributes', "group")),
     'createdAt', "createdAt",
@@ -650,6 +672,15 @@ SELECT
     'group_is_private', group_is_private,
     'description', description,
     'hibernation', hibernation,
+    'past', CASE WHEN type = 'q&a-pos' THEN true ELSE false END,
+    'within7days', CASE 
+      WHEN (type != 'q&a-pos' AND event_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')
+      OR (type = 'question' AND question_event_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days')
+      THEN true ELSE false END,
+    'beyond7days', CASE 
+      WHEN (type != 'q&a-pos' AND event_date::date > CURRENT_DATE + INTERVAL '7 days')
+      OR (type = 'question' AND question_event_date::date > CURRENT_DATE + INTERVAL '7 days')
+      THEN true ELSE false END,
     'eventDate', event_date,
     'question_id', question_id,
     'question_event_id', question_event_id,
@@ -659,56 +690,73 @@ SELECT
 FROM DistinctFeeds;`;
 
 const getUserQuery = `WITH ProfileImage AS (
-  SELECT DISTINCT ON  (files_related_morphs.related_id)
-        files_related_morphs.related_id AS profileId,
-        files
-  FROM
-        files_related_morphs
-  INNER JOIN
-         (SELECT CASE WHEN f.formats IS NOT NULL THEN json_build_object(
-            'large', (f.formats->>'large')::jsonb,
-            'medium', (f.formats->>'medium')::jsonb,
-            'small', (f.formats->>'small')::jsonb,
-            'thumbnail', (f.formats->>'thumbnail')::jsonb
-        ) ELSE NULL END formats, id, name, width, height, hash, ext, mime, size, url, preview_url, provider, provider_metadata, folder_path, created_at, updated_at  
-         FROM files f) AS files ON files.id = files_related_morphs.file_id 
-  WHERE files_related_morphs.related_type = 'api::profile.profile' 
-    AND files_related_morphs.field = 'image'
+  SELECT DISTINCT ON (frm.related_id)
+    frm.related_id AS profile_id,
+    json_build_object(
+      'formats', CASE WHEN f.formats IS NOT NULL THEN json_build_object(
+        'large', (f.formats->>'large')::jsonb,
+        'medium', (f.formats->>'medium')::jsonb,
+        'small', (f.formats->>'small')::jsonb,
+        'thumbnail', (f.formats->>'thumbnail')::jsonb
+      ) ELSE NULL END,
+      'id', f.id,
+      'name', f.name,
+      'url', f.url
+    ) AS image_data
+  FROM files_related_morphs frm
+  JOIN files f ON f.id = frm.file_id
+  WHERE frm.related_type = 'api::profile.profile' 
+    AND frm.field = 'image'
 ),
-DistinctProfilesWithoutConnections AS (
+
+ProfileInterests AS (
   SELECT
-    profiles.id,
-    profiles.username,
-    profiles.first_name,
-    profiles.last_name,
-    profiles.display_name,
-    profiles.created_at,
-    profiles.slug,
-    to_json(ProfileImage.files) AS image,
-    ROW_NUMBER() OVER (PARTITION BY profiles.created_at ORDER BY profiles.created_at DESC) AS rn
-  FROM
-    profiles
-  LEFT JOIN
-    ProfileImage ON profiles.id = ProfileImage.profileId
-  INNER JOIN
-    profiles_reduser_links ON profiles_reduser_links.profile_id = profiles.id
-  INNER JOIN
-    redusers ON profiles_reduser_links.reduser_id = redusers.id
-  WHERE
-    redusers.status = 'MEMBER'
-    AND redusers.register_step = 'finish'
-    AND NOT EXISTS (
-      SELECT 1
-      FROM profile_connections
-      INNER JOIN profile_connections_sender_links ON profile_connections.id = profile_connections_sender_links.profile_connection_id
-      INNER JOIN profile_connections_receiver_links ON profile_connections.id = profile_connections_receiver_links.profile_connection_id
-      WHERE
-        profile_connections_sender_links.profile_id = profiles.id
-        AND profile_connections_receiver_links.profile_id = profiles.id
-        AND profile_connections.status = 'approved'
-      LIMIT 1
-    )
+    picl.profile_id,
+    ARRAY_AGG(picl.interest_category_id) AS interest_ids
+  FROM profiles_interest_categories_links picl
+  GROUP BY picl.profile_id
+),
+
+ApprovedConnections AS (
+  SELECT 
+    pcs.profile_id AS sender_id,
+    pcr.profile_id AS receiver_id
+  FROM profile_connections pc
+  JOIN profile_connections_sender_links pcs ON pc.id = pcs.profile_connection_id
+  JOIN profile_connections_receiver_links pcr ON pc.id = pcr.profile_connection_id
+  WHERE pc.status = 'approved'
+),
+
+ProfileWithConnections AS (
+  SELECT
+    p.id,
+    p.username,
+    p.first_name,
+    p.last_name,
+    p.display_name,
+    p.created_at,
+    p.slug,
+    pimg.image_data AS image,
+    r.name AS role,
+    ARRAY(
+      SELECT connected_id FROM (
+        SELECT receiver_id AS connected_id FROM ApprovedConnections WHERE sender_id = p.id
+        UNION
+        SELECT sender_id AS connected_id FROM ApprovedConnections WHERE receiver_id = p.id
+      ) connections
+    ) AS connections,
+    COALESCE(pint.interest_ids, ARRAY[]::INT[]) AS interest_ids
+  FROM profiles p
+  LEFT JOIN ProfileImage pimg ON p.id = pimg.profile_id
+  LEFT JOIN ProfileInterests pint ON p.id = pint.profile_id
+  JOIN profiles_reduser_links prl ON p.id = prl.profile_id
+  JOIN redusers ru ON prl.reduser_id = ru.id
+  JOIN redusers_role_reduser_links rrl ON ru.id = rrl.reduser_id
+  JOIN role_redusers r ON rrl.role_reduser_id = r.id
+  WHERE ru.status = 'MEMBER'
+    AND ru.register_step = 'finish'
 )
+
 SELECT
   id,
   username,
@@ -717,12 +765,11 @@ SELECT
   display_name AS "displayName",
   slug,
   created_at AS "createdAt",
-  image
-FROM
-  DistinctProfilesWithoutConnections
-WHERE
-  rn = 1
-ORDER BY
-  created_at DESC;`;
+  image,
+  role,
+  connections,
+  interest_ids AS "interests"
+FROM ProfileWithConnections
+ORDER BY created_at DESC;`;
 
 module.exports = { getFeedQuery, getUserQuery };
