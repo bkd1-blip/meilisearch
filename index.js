@@ -38,6 +38,7 @@ app.post("/sync-feeds", async (req, res) => {
       "attributes.type",
       "attributes.created_by",
       "attributes.comments_by_user",
+      "attributes.typeId",
     ]);
     const result = await index.addDocuments(rows);
     res.json({ message: "Feeds synced", indexed: result });

@@ -346,9 +346,16 @@ SubscriberData AS (
     sp.first_name,
     sp.last_name,
     sp.display_name,
+	sp.pre_register,
     sp.wishes,
     sp.private,
     sel.event_id as event_id,
+    sp.first_name_slug,
+    sp.last_name_slug,
+    sp.slug,
+    sp.hibernation,
+    sp.id as profile_id,
+	sp.count_interactions,
     ProfileImage.files AS image_url,
     ROW_NUMBER() OVER (PARTITION BY sel.event_id ORDER BY s.created_at DESC) AS rn
   FROM subscribers s
@@ -361,20 +368,32 @@ SubscriberData AS (
 AggregatedSubscribers AS (
   SELECT
     event_id,
-    json_agg(
+     json_agg(
       json_build_object(
-        'subscriber_id', subscriber_id,
+        'createdAt', created_at,
+        'id', subscriber_id,
         'waitlist', waitlist,
-        'created_at', created_at,
-        'updated_at', updated_at,
-        'published_at', published_at,
-        'username', username,
-        'firstName', first_name,
-        'lastName', last_name,
-        'displayName', display_name,
-        'wishes', wishes,
-        'private', private,
-        'image_url', image_url
+        'updatedAt', updated_at,
+        'publishedAt', published_at,
+        'hibernation', hibernation,
+        'profile', json_build_object(
+          'id', profile_id,
+          'username', username,
+          'firstName', first_name,
+          'lastName', last_name,
+          'createdAt', created_at,
+          'updatedAt', updated_at,
+          'displayName', display_name,
+          'private', private,
+          'preRegister', pre_register,
+          'wishes', wishes,
+          'hibernation', hibernation,
+          'countInteractions', count_interactions,
+          'slug', slug,
+          'firstNameSlug', first_name_slug,
+          'lastNameSlug', last_name_slug,
+          'image', image_url
+        )
       )
     ) AS firstTenSubscribers
   FROM SubscriberData
@@ -462,7 +481,8 @@ FeedGroup AS (
 EventDetails AS (
   SELECT
     id as event_id,
-    date as event_date
+    date as event_date,
+    link_text as linkText 
   FROM
     events
 ),
@@ -485,6 +505,20 @@ EventQuestionDetails AS (
     events e ON qe.event_id = e.id
   WHERE
     f.type = 'question'
+),
+
+ThoughtIdeaDetails AS (
+  SELECT
+    f.id AS feed_id,
+    ti.id AS thought_idea_id
+  FROM
+    feeds f
+  LEFT JOIN
+    thoughts_thought_idea_links ttil ON f.type = 'thought' AND f.type_id = ttil.thought_id
+  LEFT JOIN
+    thought_ideas ti ON ttil.thought_idea_id = ti.id
+  WHERE
+    f.type = 'thought'
 ),
 
 AllComments AS (
@@ -553,6 +587,28 @@ Last5CommentsPerFeed AS (
   WHERE row_num <= 5
   GROUP BY feed_id
 ),
+QuestionCounts AS (
+  SELECT 
+    qel.event_id,
+    COUNT(q.id) AS total_questions
+  FROM questions_event_links qel
+  JOIN questions q ON qel.question_id = q.id
+  GROUP BY qel.event_id
+),
+  
+ThoughtDetails AS (
+  SELECT
+    t.id AS thought_id,
+    t.allow_comments
+  FROM thoughts t
+),
+
+ContentDetails AS (
+  SELECT
+    c.id AS content_id,
+    c.allow_comments
+  FROM contents c
+),
 
 DistinctFeeds AS (
   SELECT
@@ -582,10 +638,21 @@ DistinctFeeds AS (
     feeds.description,
     feeds.hibernation,
     EventDetails.event_date,
+    EventDetails.linkText, 
     EventQuestionDetails.question_id,
     EventQuestionDetails.event_id AS question_event_id,
     EventQuestionDetails.event_date AS question_event_date,
-    AggregatedSubscribers.firstTenSubscribers
+    ThoughtIdeaDetails.thought_idea_id,
+    AggregatedSubscribers.firstTenSubscribers,
+    CASE 
+      WHEN feeds.type IN ('q&a-pos', 'q&a-pre') THEN COALESCE(QuestionCounts.total_questions, 0)
+      ELSE NULL 
+    END AS total_questions,
+    CASE
+      WHEN feeds.type = 'thought' THEN ThoughtDetails.allow_comments
+      WHEN feeds.type = 'content' THEN ContentDetails.allow_comments
+      ELSE true
+    END AS allow_comments
   FROM feeds
   INNER JOIN FeedCreator ON feeds.id = FeedCreator.feed_id
   LEFT JOIN FeedFile ON feeds.id = FeedFile.feed_id
@@ -594,10 +661,16 @@ DistinctFeeds AS (
   LEFT JOIN Last5CommentsPerFeed ON feeds.id = Last5CommentsPerFeed.feed_id
   LEFT JOIN EventDetails ON feeds.type_id = EventDetails.event_id
   LEFT JOIN EventQuestionDetails ON feeds.id = EventQuestionDetails.feed_id
+  LEFT JOIN ThoughtIdeaDetails ON feeds.id = ThoughtIdeaDetails.feed_id
   LEFT JOIN AggregatedSubscribers ON 
     (feeds.type = 'question' AND AggregatedSubscribers.event_id = feeds.event)
     OR 
     (feeds.type <> 'question' AND AggregatedSubscribers.event_id = feeds.type_id)
+  LEFT JOIN QuestionCounts ON QuestionCounts.event_id = feeds.type_id
+  LEFT JOIN ThoughtDetails ON 
+    (feeds.type = 'thought' AND ThoughtDetails.thought_id = feeds.type_id)
+  LEFT JOIN ContentDetails ON 
+    (feeds.type = 'content' AND ContentDetails.content_id = feeds.type_id)
   WHERE 
     feeds.type = 'q&a-pos' OR
     feeds.type = 'q&a-pre' AND NOT EXISTS (
@@ -685,7 +758,17 @@ SELECT
     'question_id', question_id,
     'question_event_id', question_event_id,
     'question_event_date', question_event_date,
-    'firstTenSubscribers', COALESCE(firstTenSubscribers, '[]'::json)
+    'thoughtIdea', CASE WHEN type = 'thought' THEN thought_idea_id ELSE NULL END,
+    'firstTenSubscribers', COALESCE(firstTenSubscribers, '[]'::json),
+    'totalQuestions', CASE 
+      WHEN type IN ('q&a-pos', 'q&a-pre') AND total_questions > 0 THEN total_questions 
+      ELSE NULL 
+    END,
+    'linkEvent', CASE 
+      WHEN type IN ('q&a-pre', 'question') THEN linkText
+      ELSE NULL
+    END,
+    'allowComments', allow_comments
   ) AS attributes
 FROM DistinctFeeds;`;
 
