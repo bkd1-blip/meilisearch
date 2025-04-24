@@ -15,6 +15,15 @@ const pool = new Pool({
   user: process.env.DATABASE_USERNAME,
   password: process.env.DATABASE_PASSWORD,
   database: process.env.DATABASE_NAME,
+
+  // Pool management
+  max: 20,
+  min: 4, // Minimum number of clients to keep in pool
+  idleTimeoutMillis: 60000,
+  connectionTimeoutMillis: 5000,
+  maxUses: 7500, // Maximum times a connection can be reused
+  keepAlive: true, // Enable TCP keep-alive
+  keepAliveInitialDelayMillis: 30000, // Start sending keep-alive after 30s
 });
 const client = new MeiliSearch({
   host: process.env.MEILI_HOST,

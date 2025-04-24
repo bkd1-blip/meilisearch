@@ -478,6 +478,40 @@ FeedGroup AS (
   LEFT  JOIN FeedGroupFile   ON FeedGroupFile.group_id     = groups.id
 ),
 
+Last5Questions AS (
+  SELECT 
+    qel.event_id,
+    json_agg(
+      json_build_object(
+        'id', q.id,
+        'description', q.description,
+        'creatorId', p.id,
+        'creatorName', COALESCE(p.display_name, p.first_name || ' ' || p.last_name),
+        'creatorImage', pi.files,
+        'creatorWishes', p.wishes,
+        'votes', NULL, -- You can add actual votes if available
+        'answers', 0, -- You can add actual answers count if available
+        'createdAt', q.created_at,
+        'updatedAt', q.updated_at,
+        'hasUpdated', q.created_at <> q.updated_at
+      ) ORDER BY q.created_at DESC
+    ) AS last_five_questions
+  FROM questions_event_links qel
+  JOIN questions q ON qel.question_id = q.id
+  LEFT JOIN questions_creator_links qcl ON q.id = qcl.question_id
+  LEFT JOIN profiles p ON qcl.profile_id = p.id
+  LEFT JOIN ProfileImage pi ON pi.profileId = p.id
+  WHERE q.id IN (
+    SELECT q2.id 
+    FROM questions q2
+    JOIN questions_event_links qel2 ON q2.id = qel2.question_id
+    WHERE qel2.event_id = qel.event_id
+    ORDER BY q2.created_at DESC
+    LIMIT 5
+  )
+  GROUP BY qel.event_id
+),
+
 EventDetails AS (
   SELECT
     id as event_id,
@@ -507,18 +541,91 @@ EventQuestionDetails AS (
     f.type = 'question'
 ),
 
+-- Updated Thought connections through converging_contents
+ThoughtConnections AS (
+  SELECT
+    f.id AS feed_id,
+    t.id AS thought_id
+  FROM
+    feeds f
+  JOIN converging_contents cc ON f.type_id = cc.id AND f.type = 'thought'
+  JOIN converging_contents_thought_links cctl ON cc.id = cctl.converging_content_id
+  JOIN thoughts t ON cctl.thought_id = t.id
+  WHERE
+    f.type = 'thought'
+),
+
+-- Updated ThoughtIdeaDetails that connects through converging_contents
 ThoughtIdeaDetails AS (
   SELECT
     f.id AS feed_id,
-    ti.id AS thought_idea_id
+    ti.id AS thought_idea_id,
+    ti.idea AS thought_idea
   FROM
     feeds f
-  LEFT JOIN
-    thoughts_thought_idea_links ttil ON f.type = 'thought' AND f.type_id = ttil.thought_id
-  LEFT JOIN
-    thought_ideas ti ON ttil.thought_idea_id = ti.id
+  JOIN converging_contents cc ON f.type_id = cc.id AND f.type = 'thought'
+  JOIN converging_contents_thought_links cctl ON cc.id = cctl.converging_content_id
+  JOIN thoughts t ON cctl.thought_id = t.id
+  LEFT JOIN thoughts_thought_idea_links ttil ON t.id = ttil.thought_id
+  LEFT JOIN thought_ideas ti ON ttil.thought_idea_id = ti.id
   WHERE
     f.type = 'thought'
+),
+
+-- Updated Content connections through converging_contents
+ContentConnections AS (
+  SELECT
+    f.id AS feed_id,
+    c.id AS content_id
+  FROM
+    feeds f
+  JOIN converging_contents cc ON f.type_id = cc.id AND f.type = 'content'
+  JOIN contents_converging_content_links ccl ON cc.id = ccl.converging_content_id
+  JOIN contents c ON ccl.content_id = c.id
+  WHERE
+    f.type = 'content'
+),
+
+-- Count interactions for thoughts
+ThoughtInteractions AS (
+  SELECT
+    tc.thought_id,
+    COUNT(itl.interaction_id) AS interactions_quantity
+  FROM ThoughtConnections tc
+  LEFT JOIN interactions_thought_links itl ON tc.thought_id = itl.thought_id
+  GROUP BY tc.thought_id
+),
+
+-- Count interactions for contents
+ContentInteractions AS (
+  SELECT
+    cc.content_id,
+    COUNT(icl.interaction_id) AS interactions_quantity
+  FROM ContentConnections cc
+  LEFT JOIN interactions_content_links icl ON cc.content_id = icl.content_id
+  GROUP BY cc.content_id
+),
+
+-- Count comments for thoughts
+ThoughtComments AS (
+  SELECT
+    tc.thought_id,
+    COUNT(ctl.comment_id) AS total_comments
+  FROM ThoughtConnections tc
+  LEFT JOIN comments_thought_links ctl ON tc.thought_id = ctl.thought_id
+  LEFT JOIN comments cm ON ctl.comment_id = cm.id AND cm.hibernation = false
+  GROUP BY tc.thought_id
+),
+
+-- Count comments for contents
+ContentComments AS (
+  SELECT
+    cc.content_id,
+    COUNT(ccl.comment_id) AS total_comments
+  FROM ContentConnections cc
+  LEFT JOIN comments_content_links ccl ON cc.content_id = ccl.content_id
+  LEFT JOIN comments cm ON ccl.comment_id = cm.id AND cm.hibernation = false
+  GROUP BY cc.content_id
 ),
 
 AllComments AS (
@@ -535,8 +642,10 @@ AllComments AS (
     c.updated_at,
     ProfileImage.url AS creator_image_url
   FROM feeds f
-  LEFT JOIN comments_content_links ccl ON f.type = 'content' AND f.type_id = ccl.content_id
-  LEFT JOIN comments_thought_links ctl ON f.type = 'thought' AND f.type_id = ctl.thought_id
+  LEFT JOIN ContentConnections cc ON f.id = cc.feed_id AND f.type = 'content'
+  LEFT JOIN ThoughtConnections tc ON f.id = tc.feed_id AND f.type = 'thought'
+  LEFT JOIN comments_content_links ccl ON cc.content_id = ccl.content_id
+  LEFT JOIN comments_thought_links ctl ON tc.thought_id = ctl.thought_id
   LEFT JOIN comments c ON c.id = COALESCE(ccl.comment_id, ctl.comment_id) AND c.hibernation = false
   LEFT JOIN comments_creator_links ccre ON ccre.comment_id = c.id
   LEFT JOIN profiles p ON p.id = ccre.profile_id
@@ -643,6 +752,7 @@ DistinctFeeds AS (
     EventQuestionDetails.event_id AS question_event_id,
     EventQuestionDetails.event_date AS question_event_date,
     ThoughtIdeaDetails.thought_idea_id,
+    ThoughtIdeaDetails.thought_idea,
     AggregatedSubscribers.firstTenSubscribers,
     CASE 
       WHEN feeds.type IN ('q&a-pos', 'q&a-pre') THEN COALESCE(QuestionCounts.total_questions, 0)
@@ -652,7 +762,22 @@ DistinctFeeds AS (
       WHEN feeds.type = 'thought' THEN ThoughtDetails.allow_comments
       WHEN feeds.type = 'content' THEN ContentDetails.allow_comments
       ELSE true
-    END AS allow_comments
+    END AS allow_comments,
+    -- Add the connected thought_id and content_id from the new CTEs
+    tc.thought_id AS connected_thought_id,
+    cc.content_id AS connected_content_id,
+    -- Add interactions and comments counts
+    CASE
+      WHEN feeds.type = 'thought' THEN ti.interactions_quantity
+      WHEN feeds.type = 'content' THEN ci.interactions_quantity
+      ELSE NULL
+    END AS interactions_quantity,
+    CASE
+      WHEN feeds.type = 'thought' THEN tcm.total_comments
+      WHEN feeds.type = 'content' THEN ccm.total_comments
+      ELSE NULL
+    END AS total_comments,
+	Last5Questions.last_five_questions AS last_five_questions
   FROM feeds
   INNER JOIN FeedCreator ON feeds.id = FeedCreator.feed_id
   LEFT JOIN FeedFile ON feeds.id = FeedFile.feed_id
@@ -671,6 +796,16 @@ DistinctFeeds AS (
     (feeds.type = 'thought' AND ThoughtDetails.thought_id = feeds.type_id)
   LEFT JOIN ContentDetails ON 
     (feeds.type = 'content' AND ContentDetails.content_id = feeds.type_id)
+  LEFT JOIN ThoughtConnections tc ON feeds.id = tc.feed_id AND feeds.type = 'thought'
+  LEFT JOIN ContentConnections cc ON feeds.id = cc.feed_id AND feeds.type = 'content'
+  LEFT JOIN ThoughtInteractions ti ON tc.thought_id = ti.thought_id
+  LEFT JOIN ContentInteractions ci ON cc.content_id = ci.content_id
+  LEFT JOIN ThoughtComments tcm ON tc.thought_id = tcm.thought_id
+  LEFT JOIN ContentComments ccm ON cc.content_id = ccm.content_id
+  LEFT JOIN Last5Questions ON 
+  (feeds.type IN ('q&a-pre', 'q&a-pos') AND Last5Questions.event_id = feeds.type_id)
+    OR
+  (feeds.type = 'question' AND Last5Questions.event_id = feeds.event)
   WHERE 
     feeds.type = 'q&a-pos' OR
     feeds.type = 'q&a-pre' AND NOT EXISTS (
@@ -758,7 +893,14 @@ SELECT
     'question_id', question_id,
     'question_event_id', question_event_id,
     'question_event_date', question_event_date,
-    'thoughtIdea', CASE WHEN type = 'thought' THEN thought_idea_id ELSE NULL END,
+    'thoughtIdea', 
+    CASE WHEN type = 'thought' 
+      THEN json_build_object(
+      'thought_idea_id', thought_idea_id,
+      'converging_content_id', "typeId",
+      'idea', thought_idea
+    ) 
+    ELSE NULL END,
     'firstTenSubscribers', COALESCE(firstTenSubscribers, '[]'::json),
     'totalQuestions', CASE 
       WHEN type IN ('q&a-pos', 'q&a-pre') AND total_questions > 0 THEN total_questions 
@@ -768,7 +910,13 @@ SELECT
       WHEN type IN ('q&a-pre', 'question') THEN linkText
       ELSE NULL
     END,
-    'allowComments', allow_comments
+    'allowComments', allow_comments,
+    'interactionsQuantity', interactions_quantity,
+    'totalComments', total_comments,
+	'lastFiveQuestions', CASE 
+      WHEN type IN ('q&a-pre', 'q&a-pos', 'question') THEN COALESCE(last_five_questions, '[]'::json)
+      ELSE NULL
+    END
   ) AS attributes
 FROM DistinctFeeds;`;
 
